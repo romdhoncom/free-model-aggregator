@@ -17,9 +17,9 @@ const PROBE_TIMEOUT_MS = 5000;
 const PROVIDER_TIMEOUT_MS = 25000;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** How many providers one request may try before it gives up. */
-const MAX_ATTEMPTS = 6;
-/** A provider refused this many times: spend no more calls on it this trial. */
-const RETIRE_AFTER = 2;
+const MAX_ATTEMPTS = 8;
+/** A provider refused this many calls running: spend no more calls on it this trial. */
+const RETIRE_AFTER = 3;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -34,7 +34,7 @@ function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
 
-/** Which providers still answer: a provider that refused twice is taken to be out of free-tier budget. */
+/** Which providers still answer: a provider that refuses three calls running is taken to be out of budget. */
 class Health {
   refusals = new Map<string, number>();
   retired = new Set<string>();
@@ -43,7 +43,11 @@ class Health {
     return !this.retired.has(id);
   }
 
-  note(id: string, code: string): void {
+  served(id: string): void {
+    this.refusals.set(id, 0);
+  }
+
+  refused(id: string, code: string): void {
     if (code === 'concurrent_requests') return;
     const count = (this.refusals.get(id) ?? 0) + 1;
     this.refusals.set(id, count);
@@ -119,15 +123,22 @@ async function serve(api: 'openai' | 'anthropic', body: Json): Promise<Reply> {
   for (const candidate of candidates) {
     if (!health.alive(candidate.provider.id)) continue;
     if (attempts >= MAX_ATTEMPTS) break;
-    attempts += 1;
-    const answer = await callProvider(candidate, api, body);
-    if (answer.ok && answer.text !== '') {
-      log(`${api}${stream ? '-stream' : ''} served by ${candidate.provider.id}/${candidate.model} (${candidate.rating}) after ${attempts} call(s)`);
-      return api === 'openai' ? openAIReply(answer.text, answer.usage, candidate.model, stream, answer.stop) : anthropicReply(answer.text, answer.usage, candidate.model, stream, answer.stop);
+    // A refusal is often one entry of a provider's failure schedule and the next call answers, so ask
+    // the same model again once before falling down the ranking.
+    for (let try_ = 0; try_ < 2; try_ += 1) {
+      if (attempts >= MAX_ATTEMPTS) break;
+      attempts += 1;
+      const answer = await callProvider(candidate, api, body);
+      if (answer.ok && answer.text !== '') {
+        health.served(candidate.provider.id);
+        log(`${api}${stream ? '-stream' : ''} served by ${candidate.provider.id}/${candidate.model} (${candidate.rating}) on call ${attempts}`);
+        return api === 'openai' ? openAIReply(answer.text, answer.usage, candidate.model, stream, answer.stop) : anthropicReply(answer.text, answer.usage, candidate.model, stream, answer.stop);
+      }
+      last = answer;
+      health.refused(candidate.provider.id, answer.code);
+      log(`${candidate.provider.id}/${candidate.model} refused (${answer.status} ${answer.code})`);
+      if (answer.status === 400 || answer.status === 401 || answer.status === 404) break;
     }
-    last = answer;
-    health.note(candidate.provider.id, answer.code);
-    log(`${candidate.provider.id}/${candidate.model} refused (${answer.status} ${answer.code}); trying the next free model`);
   }
   return errorReply(api, 502, last?.code ?? 'no_free_model', last === null ? 'no provider answered' : `every free model refused this request (last: HTTP ${last.status} ${last.code})`);
 }

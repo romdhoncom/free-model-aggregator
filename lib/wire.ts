@@ -429,6 +429,16 @@ export function openAIReply(text: string, usage: Usage, model: string, stream: b
   const frames = [sse(null, chunk({ role: 'assistant', content: '' }, null))];
   for (const piece of chunks(text)) frames.push(sse(null, chunk({ content: piece }, null)));
   frames.push(sse(null, chunk({}, finish)));
+  frames.push(
+    sse(null, {
+      id: 'chatcmpl-entry',
+      object: 'chat.completion.chunk',
+      created: FIXED_CREATED,
+      model,
+      choices: [],
+      usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output },
+    }),
+  );
   frames.push('data: [DONE]\n\n');
   return { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' }, body: frames.join('') };
 }
